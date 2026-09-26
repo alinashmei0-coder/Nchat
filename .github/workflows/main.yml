@@ -1,0 +1,173 @@
+name: Build NChat IPA
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build NChat
+    runs-on: macos-14
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Find project ZIP
+        id: zip
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ZIP_FILE="$(find . -maxdepth 2 -type f -iname '*.zip' | head -n 1)"
+
+          if [ -z "$ZIP_FILE" ]; then
+            echo "❌ No ZIP file found in repository"
+            exit 1
+          fi
+
+          echo "Found ZIP: $ZIP_FILE"
+          echo "file=$ZIP_FILE" >> "$GITHUB_OUTPUT"
+
+      - name: Extract project
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p "$RUNNER_TEMP/nchat-source"
+          unzip -q "${{ steps.zip.outputs.file }}" -d "$RUNNER_TEMP/nchat-source"
+
+          echo "=== Extracted files ==="
+          find "$RUNNER_TEMP/nchat-source" -maxdepth 3 -type f | head -100
+
+      - name: Locate project.yml
+        id: project
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          PROJECT_YML="$(find "$RUNNER_TEMP/nchat-source" -type f -name 'project.yml' | head -n 1)"
+
+          if [ -z "$PROJECT_YML" ]; then
+            echo "❌ project.yml not found after extracting ZIP"
+            exit 1
+          fi
+
+          PROJECT_DIR="$(dirname "$PROJECT_YML")"
+
+          echo "Project directory: $PROJECT_DIR"
+          echo "dir=$PROJECT_DIR" >> "$GITHUB_OUTPUT"
+
+      - name: Select Xcode
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Available Xcode installations:"
+          ls -1 /Applications | grep Xcode || true
+
+          XCODE_APP="$(ls -d /Applications/Xcode*.app 2>/dev/null | sort -V | tail -n 1)"
+
+          if [ -z "$XCODE_APP" ]; then
+            echo "❌ Xcode not found"
+            exit 1
+          fi
+
+          echo "Using: $XCODE_APP"
+          sudo xcode-select -s "$XCODE_APP/Contents/Developer"
+
+          xcodebuild -version
+          swift --version
+
+      - name: Install XcodeGen
+        shell: bash
+        run: |
+          set -euo pipefail
+          brew install xcodegen
+          xcodegen --version
+
+      - name: Generate Xcode project
+        working-directory: ${{ steps.project.outputs.dir }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          xcodegen generate
+
+          echo "=== Generated projects ==="
+          find . -maxdepth 2 -name '*.xcodeproj' -print
+
+      - name: Show build settings
+        working-directory: ${{ steps.project.outputs.dir }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          xcodebuild \
+            -project NChat.xcodeproj \
+            -scheme NChat \
+            -configuration Release \
+            -showBuildSettings \
+            CODE_SIGNING_ALLOWED=NO \
+            | grep -E 'PRODUCT_NAME|PRODUCT_BUNDLE_IDENTIFIER|SDKROOT|IPHONEOS_DEPLOYMENT_TARGET' \
+            || true
+
+      - name: Build NChat
+        working-directory: ${{ steps.project.outputs.dir }}
+        shell: bash
+        run: |
+          set -o pipefail
+
+          rm -rf "$RUNNER_TEMP/NChatBuild"
+
+          xcodebuild \
+            -project NChat.xcodeproj \
+            -scheme NChat \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath "$RUNNER_TEMP/NChatBuild" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            clean build \
+            | tee "$RUNNER_TEMP/xcodebuild.log"
+
+      - name: Create unsigned IPA
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          APP_PATH="$RUNNER_TEMP/NChatBuild/Build/Products/Release-iphoneos/NChat.app"
+
+          if [ ! -d "$APP_PATH" ]; then
+            echo "❌ NChat.app was not generated"
+            echo "Searching build output..."
+            find "$RUNNER_TEMP/NChatBuild" -name '*.app' -print || true
+            exit 1
+          fi
+
+          mkdir -p "$RUNNER_TEMP/ipa/Payload"
+          cp -R "$APP_PATH" "$RUNNER_TEMP/ipa/Payload/NChat.app"
+
+          cd "$RUNNER_TEMP/ipa"
+          zip -qry "$GITHUB_WORKSPACE/NChat-unsigned.ipa" Payload
+
+          echo "=== IPA ==="
+          ls -lh "$GITHUB_WORKSPACE/NChat-unsigned.ipa"
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: NChat-IPA
+          path: NChat-unsigned.ipa
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: NChat-Build-Logs
+          path: ${{ runner.temp }}/xcodebuild.log
+          if-no-files-found: ignore
+          retention-days: 7
